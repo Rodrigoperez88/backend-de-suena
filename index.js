@@ -178,6 +178,29 @@ const parseProductPayload = (body, { partial = false } = {}) => {
   return { data, errors };
 };
 
+const parseCategoryPayload = (body, { partial = false } = {}) => {
+  const errors = [];
+  const data = {};
+
+  if ("name" in body || !partial) {
+    const name = sanitizeText(body.name);
+
+    if (!name) {
+      errors.push("El nombre de la categoria es obligatorio");
+    } else {
+      data.name = name;
+    }
+  }
+
+  if ("image" in body) {
+    data.image = sanitizeText(body.image);
+  } else if (!partial) {
+    data.image = null;
+  }
+
+  return { data, errors };
+};
+
 const parseOrderItems = (items) => {
   if (!Array.isArray(items) || items.length === 0) {
     return {
@@ -231,6 +254,25 @@ app.get("/productos", async (req, res) => {
   }
 });
 
+app.get("/categorias", async (req, res) => {
+  try {
+    const categories = await prisma.category.findMany({
+      orderBy: [
+        { createdAt: "asc" },
+        { id: "asc" },
+      ],
+    });
+
+    res.json(categories);
+  } catch (error) {
+    console.error("Error al obtener categorias:", error);
+    res.status(500).json({
+      error: "Error al obtener categorias",
+      detalle: error.message,
+    });
+  }
+});
+
 if (CLERK_IS_CONFIGURED) {
   app.use("/admin", clerkMiddleware(), requireAdmin);
 } else {
@@ -252,6 +294,147 @@ app.get("/admin/productos", async (req, res) => {
     console.error("Error al obtener productos para admin:", error);
     res.status(500).json({
       error: "Error al obtener productos",
+      detalle: error.message,
+    });
+  }
+});
+
+app.get("/admin/categorias", async (req, res) => {
+  try {
+    const categories = await prisma.category.findMany({
+      orderBy: [
+        { createdAt: "asc" },
+        { id: "asc" },
+      ],
+    });
+
+    res.json(categories);
+  } catch (error) {
+    console.error("Error al obtener categorias para admin:", error);
+    res.status(500).json({
+      error: "Error al obtener categorias",
+      detalle: error.message,
+    });
+  }
+});
+
+app.post("/admin/categorias", async (req, res) => {
+  try {
+    const { data, errors } = parseCategoryPayload(req.body);
+
+    if (errors.length > 0) {
+      return sendValidationError(res, errors);
+    }
+
+    const category = await prisma.category.create({ data });
+
+    res.status(201).json({
+      ok: true,
+      message: "Categoria creada correctamente",
+      category,
+    });
+  } catch (error) {
+    console.error("Error al crear categoria:", error);
+
+    if (error.code === "P2002") {
+      return sendValidationError(res, ["Ya existe una categoria con ese nombre"]);
+    }
+
+    res.status(500).json({
+      error: "Error al crear categoria",
+      detalle: error.message,
+    });
+  }
+});
+
+app.patch("/admin/categorias/:id", async (req, res) => {
+  try {
+    const categoryId = parseInteger(req.params.id);
+
+    if (categoryId === null || categoryId <= 0) {
+      return sendValidationError(res, ["El id de la categoria es invalido"]);
+    }
+
+    const { data, errors } = parseCategoryPayload(req.body, { partial: true });
+
+    if (Object.keys(data).length === 0) {
+      errors.push("No hay campos para actualizar");
+    }
+
+    if (errors.length > 0) {
+      return sendValidationError(res, errors);
+    }
+
+    const category = await prisma.category.update({
+      where: { id: categoryId },
+      data,
+    });
+
+    res.json({
+      ok: true,
+      message: "Categoria actualizada correctamente",
+      category,
+    });
+  } catch (error) {
+    console.error("Error al actualizar categoria:", error);
+
+    if (error.code === "P2025") {
+      return res.status(404).json({
+        error: "Categoria no encontrada",
+      });
+    }
+
+    if (error.code === "P2002") {
+      return sendValidationError(res, ["Ya existe una categoria con ese nombre"]);
+    }
+
+    res.status(500).json({
+      error: "Error al actualizar categoria",
+      detalle: error.message,
+    });
+  }
+});
+
+app.delete("/admin/categorias/:id", async (req, res) => {
+  try {
+    const categoryId = parseInteger(req.params.id);
+
+    if (categoryId === null || categoryId <= 0) {
+      return sendValidationError(res, ["El id de la categoria es invalido"]);
+    }
+
+    const category = await prisma.category.findUnique({
+      where: { id: categoryId },
+    });
+
+    if (!category) {
+      return res.status(404).json({
+        error: "Categoria no encontrada",
+      });
+    }
+
+    const productsCount = await prisma.product.count({
+      where: { category: category.name },
+    });
+
+    if (productsCount > 0) {
+      return res.status(409).json({
+        error: "No se puede eliminar una categoria con productos asociados",
+      });
+    }
+
+    await prisma.category.delete({
+      where: { id: categoryId },
+    });
+
+    res.json({
+      ok: true,
+      message: "Categoria eliminada correctamente",
+    });
+  } catch (error) {
+    console.error("Error al eliminar categoria:", error);
+    res.status(500).json({
+      error: "Error al eliminar categoria",
       detalle: error.message,
     });
   }
