@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { clerkClient, clerkMiddleware, getAuth } from "@clerk/express";
 import prisma from "./prismaClient.js";
 
 dotenv.config();
@@ -25,6 +26,11 @@ const ENV_ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || process.env.FRONTEND_UR
   .map((origin) => origin.trim())
   .filter(Boolean);
 const CORS_ALLOWED_ORIGINS = [...new Set([...ALLOWED_ORIGINS, ...ENV_ALLOWED_ORIGINS])];
+const CLERK_IS_CONFIGURED = Boolean(process.env.CLERK_SECRET_KEY);
+const ADMIN_EMAILS = (process.env.CLERK_ADMIN_EMAILS || "")
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean);
 const ORDER_STATUSES = [
   "pendiente",
   "confirmado",
@@ -49,6 +55,53 @@ app.use(
 );
 
 app.use(express.json());
+
+if (CLERK_IS_CONFIGURED) {
+  app.use(clerkMiddleware());
+} else {
+  console.warn("CLERK_SECRET_KEY no esta configurada. Las rutas admin no estaran disponibles.");
+}
+
+const requireAdmin = async (req, res, next) => {
+  try {
+    if (!CLERK_IS_CONFIGURED) {
+      return res.status(500).json({
+        error: "Autenticacion admin no configurada",
+      });
+    }
+
+    const auth = getAuth(req);
+
+    if (!auth.isAuthenticated || !auth.userId) {
+      return res.status(401).json({
+        error: "No autenticado",
+      });
+    }
+
+    if (ADMIN_EMAILS.length === 0) {
+      return res.status(403).json({
+        error: "No hay emails admin configurados",
+      });
+    }
+
+    const user = await clerkClient.users.getUser(auth.userId);
+    const userEmails = user.emailAddresses.map((email) => email.emailAddress.toLowerCase());
+    const isAdmin = userEmails.some((email) => ADMIN_EMAILS.includes(email));
+
+    if (!isAdmin) {
+      return res.status(403).json({
+        error: "Usuario sin permisos de administrador",
+      });
+    }
+
+    return next();
+  } catch (error) {
+    console.error("Error al validar admin:", error);
+    return res.status(401).json({
+      error: "No se pudo validar la sesion admin",
+    });
+  }
+};
 
 const sanitizeText = (value) => {
   if (typeof value !== "string") {
@@ -183,6 +236,8 @@ app.get("/productos", async (req, res) => {
     });
   }
 });
+
+app.use("/admin", requireAdmin);
 
 app.get("/admin/productos", async (req, res) => {
   try {
