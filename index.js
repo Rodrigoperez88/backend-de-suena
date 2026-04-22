@@ -201,6 +201,21 @@ const parseCategoryPayload = (body, { partial = false } = {}) => {
   return { data, errors };
 };
 
+const getPublicSettings = async () => {
+  const settings = await prisma.storeSetting.findMany({
+    where: {
+      key: {
+        in: ["heroImage"],
+      },
+    },
+  });
+
+  return settings.reduce((acc, setting) => {
+    acc[setting.key] = setting.value;
+    return acc;
+  }, {});
+};
+
 const parseOrderItems = (items) => {
   if (!Array.isArray(items) || items.length === 0) {
     return {
@@ -273,6 +288,20 @@ app.get("/categorias", async (req, res) => {
   }
 });
 
+app.get("/configuracion", async (req, res) => {
+  try {
+    const settings = await getPublicSettings();
+
+    res.json(settings);
+  } catch (error) {
+    console.error("Error al obtener configuracion:", error);
+    res.status(500).json({
+      error: "Error al obtener configuracion",
+      detalle: error.message,
+    });
+  }
+});
+
 if (CLERK_IS_CONFIGURED) {
   app.use("/admin", clerkMiddleware(), requireAdmin);
 } else {
@@ -294,6 +323,53 @@ app.get("/admin/productos", async (req, res) => {
     console.error("Error al obtener productos para admin:", error);
     res.status(500).json({
       error: "Error al obtener productos",
+      detalle: error.message,
+    });
+  }
+});
+
+app.get("/admin/configuracion", async (req, res) => {
+  try {
+    const settings = await getPublicSettings();
+
+    res.json(settings);
+  } catch (error) {
+    console.error("Error al obtener configuracion admin:", error);
+    res.status(500).json({
+      error: "Error al obtener configuracion",
+      detalle: error.message,
+    });
+  }
+});
+
+app.patch("/admin/configuracion", async (req, res) => {
+  try {
+    const heroImage = sanitizeText(req.body.heroImage);
+
+    const setting = await prisma.storeSetting.upsert({
+      where: {
+        key: "heroImage",
+      },
+      update: {
+        value: heroImage,
+      },
+      create: {
+        key: "heroImage",
+        value: heroImage,
+      },
+    });
+
+    res.json({
+      ok: true,
+      message: "Configuracion actualizada correctamente",
+      settings: {
+        [setting.key]: setting.value,
+      },
+    });
+  } catch (error) {
+    console.error("Error al actualizar configuracion:", error);
+    res.status(500).json({
+      error: "Error al actualizar configuracion",
       detalle: error.message,
     });
   }
