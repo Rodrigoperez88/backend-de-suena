@@ -116,11 +116,98 @@ const parseInteger = (value) => {
   return Number.isInteger(parsedValue) ? parsedValue : null;
 };
 
+const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN?.trim() || "";
+const MERCADO_PAGO_WEBHOOK_URL = process.env.MERCADO_PAGO_WEBHOOK_URL?.trim() || "";
+const FRONTEND_BASE_URL = (process.env.FRONTEND_URL || ENV_ALLOWED_ORIGINS[0] || "").replace(/\/$/, "");
+
 const sendValidationError = (res, details) => {
   return res.status(400).json({
     error: "Datos invalidos",
     details,
   });
+};
+
+const validateOrderPayload = async (body) => {
+  const normalizedCustomerName = sanitizeText(body.customerName);
+  const normalizedCustomerPhone = sanitizeText(body.customerPhone);
+  const normalizedAddress = sanitizeText(body.address);
+  const normalizedDeliveryMethod = sanitizeText(body.deliveryMethod);
+  const normalizedNotes = sanitizeText(body.notes);
+  const { errors: itemErrors, normalizedItems } = parseOrderItems(body.items);
+
+  if (!normalizedCustomerName || !normalizedCustomerPhone || !normalizedDeliveryMethod) {
+    return {
+      errors: ["Faltan datos obligatorios del cliente"],
+    };
+  }
+
+  if (!["retiro", "envio"].includes(normalizedDeliveryMethod)) {
+    return {
+      errors: ["El metodo de entrega es invalido"],
+    };
+  }
+
+  if (normalizedDeliveryMethod === "envio" && !normalizedAddress) {
+    return {
+      errors: ["La direccion es obligatoria para envios"],
+    };
+  }
+
+  if (itemErrors.length > 0) {
+    return {
+      errors: itemErrors,
+    };
+  }
+
+  const productIds = normalizedItems.map((item) => item.id);
+  const products = await prisma.product.findMany({
+    where: {
+      id: {
+        in: productIds,
+      },
+    },
+  });
+
+  if (products.length !== normalizedItems.length) {
+    return {
+      errors: ["Uno o mas productos no existen"],
+    };
+  }
+
+  for (const item of normalizedItems) {
+    const product = products.find((candidate) => candidate.id === item.id);
+
+    if (!product) {
+      return {
+        errors: [`Producto invalido: ${item.id}`],
+      };
+    }
+
+    if (product.stock < item.quantity) {
+      return {
+        errors: [`Stock insuficiente para ${product.name}`],
+      };
+    }
+  }
+
+  const total = normalizedItems.reduce((acc, item) => {
+    const product = products.find((candidate) => candidate.id === item.id);
+    return acc + product.price * item.quantity;
+  }, 0);
+
+  return {
+    errors: [],
+    order: {
+      customerName: normalizedCustomerName,
+      customerPhone: normalizedCustomerPhone,
+      address: normalizedAddress,
+      deliveryMethod: normalizedDeliveryMethod,
+      notes: normalizedNotes,
+      items: normalizedItems,
+      products,
+      total,
+    },
+  };
 };
 
 const parseProductPayload = (body, { partial = false } = {}) => {
@@ -628,76 +715,27 @@ app.delete("/admin/productos/:id", async (req, res) => {
 
 app.post("/pedidos", async (req, res) => {
   try {
-    const normalizedCustomerName = sanitizeText(req.body.customerName);
-    const normalizedCustomerPhone = sanitizeText(req.body.customerPhone);
-    const normalizedAddress = sanitizeText(req.body.address);
-    const normalizedDeliveryMethod = sanitizeText(req.body.deliveryMethod);
-    const normalizedNotes = sanitizeText(req.body.notes);
-    const { errors: itemErrors, normalizedItems } = parseOrderItems(req.body.items);
+    const { errors, order } = await validateOrderPayload(req.body);
 
-    if (!normalizedCustomerName || !normalizedCustomerPhone || !normalizedDeliveryMethod) {
-      return sendValidationError(res, ["Faltan datos obligatorios del cliente"]);
+    if (errors.length > 0) {
+      return sendValidationError(res, errors);
     }
-
-    if (!["retiro", "envio"].includes(normalizedDeliveryMethod)) {
-      return sendValidationError(res, ["El metodo de entrega es invalido"]);
-    }
-
-    if (normalizedDeliveryMethod === "envio" && !normalizedAddress) {
-      return sendValidationError(res, ["La direccion es obligatoria para envios"]);
-    }
-
-    if (itemErrors.length > 0) {
-      return sendValidationError(res, itemErrors);
-    }
-
-    const productIds = normalizedItems.map((item) => item.id);
-    const productosDB = await prisma.product.findMany({
-      where: {
-        id: {
-          in: productIds,
-        },
-      },
-    });
-
-    if (productosDB.length !== normalizedItems.length) {
-      return sendValidationError(res, ["Uno o mas productos no existen"]);
-    }
-
-    for (const item of normalizedItems) {
-      const productoDB = productosDB.find((product) => product.id === item.id);
-
-      if (!productoDB) {
-        return sendValidationError(res, [`Producto invalido: ${item.id}`]);
-      }
-
-      if (productoDB.stock < item.quantity) {
-        return sendValidationError(res, [
-          `Stock insuficiente para ${productoDB.name}`,
-        ]);
-      }
-    }
-
-    const total = normalizedItems.reduce((acc, item) => {
-      const productoDB = productosDB.find((product) => product.id === item.id);
-      return acc + productoDB.price * item.quantity;
-    }, 0);
 
     const pedidoCreado = await prisma.$transaction(async (tx) => {
       const nuevoPedido = await tx.order.create({
         data: {
-          customerName: normalizedCustomerName,
-          customerPhone: normalizedCustomerPhone,
-          address: normalizedAddress,
-          deliveryMethod: normalizedDeliveryMethod,
-          notes: normalizedNotes,
-          total,
+          customerName: order.customerName,
+          customerPhone: order.customerPhone,
+          address: order.address,
+          deliveryMethod: order.deliveryMethod,
+          notes: order.notes,
+          total: order.total,
           status: "pendiente",
         },
       });
 
-      for (const item of normalizedItems) {
-        const productoDB = productosDB.find((product) => product.id === item.id);
+      for (const item of order.items) {
+        const productoDB = order.products.find((product) => product.id === item.id);
 
         await tx.orderItem.create({
           data: {
@@ -732,6 +770,106 @@ app.post("/pedidos", async (req, res) => {
     console.error("Error al crear pedido:", error);
     res.status(500).json({
       error: "Error al crear pedido",
+      detalle: error.message,
+    });
+  }
+});
+
+app.post("/pagos/mercado-pago/preferencia", async (req, res) => {
+  try {
+    if (!MERCADO_PAGO_ACCESS_TOKEN) {
+      return res.status(500).json({
+        error: "Mercado Pago no configurado",
+        detalle: "Falta MERCADO_PAGO_ACCESS_TOKEN en el backend.",
+      });
+    }
+
+    if (!FRONTEND_BASE_URL) {
+      return res.status(500).json({
+        error: "No se pudo determinar la URL del frontend",
+        detalle: "Configura FRONTEND_URL para usar Mercado Pago.",
+      });
+    }
+
+    const { errors, order } = await validateOrderPayload(req.body);
+
+    if (errors.length > 0) {
+      return sendValidationError(res, errors);
+    }
+
+    const preferencePayload = {
+      items: order.items.map((item) => {
+        const product = order.products.find((candidate) => candidate.id === item.id);
+
+        return {
+          id: String(product.id),
+          title: product.name,
+          description: product.description || undefined,
+          quantity: item.quantity,
+          currency_id: "ARS",
+          unit_price: Number(product.price),
+          picture_url: product.image || undefined,
+          category_id: product.category || undefined,
+        };
+      }),
+      payer: {
+        name: order.customerName,
+        phone: {
+          number: order.customerPhone,
+        },
+        address: order.address
+          ? {
+              street_name: order.address,
+            }
+          : undefined,
+      },
+      back_urls: {
+        success: `${FRONTEND_BASE_URL}/?mp_status=success`,
+        failure: `${FRONTEND_BASE_URL}/?mp_status=failure`,
+        pending: `${FRONTEND_BASE_URL}/?mp_status=pending`,
+      },
+      auto_return: "approved",
+      external_reference: `SUENA-${Date.now()}`,
+      statement_descriptor: "SUENA EN GRANDE",
+      notification_url: MERCADO_PAGO_WEBHOOK_URL || undefined,
+      metadata: {
+        customerName: order.customerName,
+        customerPhone: order.customerPhone,
+        deliveryMethod: order.deliveryMethod,
+        address: order.address || "",
+        notes: order.notes || "",
+      },
+    };
+
+    const mpResponse = await fetch("https://api.mercadopago.com/checkout/preferences", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(preferencePayload),
+    });
+
+    const mpData = await mpResponse.json();
+
+    if (!mpResponse.ok) {
+      console.error("Error al crear preferencia de Mercado Pago:", mpData);
+      return res.status(500).json({
+        error: "No se pudo iniciar Mercado Pago",
+        detalle: mpData?.message || mpData?.error || "Error al crear la preferencia de pago.",
+      });
+    }
+
+    return res.status(201).json({
+      ok: true,
+      preferenceId: mpData.id,
+      initPoint: mpData.init_point,
+      sandboxInitPoint: mpData.sandbox_init_point,
+    });
+  } catch (error) {
+    console.error("Error al preparar Checkout Pro:", error);
+    return res.status(500).json({
+      error: "Error al preparar el pago con Mercado Pago",
       detalle: error.message,
     });
   }
