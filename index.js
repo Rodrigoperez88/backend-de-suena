@@ -39,6 +39,31 @@ const ORDER_STATUSES = [
   "entregado",
   "cancelado",
 ];
+const STORE_SETTING_KEYS = [
+  "heroImage",
+  "heroEyebrow",
+  "heroTitle",
+  "heroText",
+  "heroTagline1",
+  "heroTagline2",
+  "heroTagline3",
+  "heroCtaNote",
+  "heroFloatingLabel",
+  "heroFloatingTitle",
+  "benefitsEyebrow",
+  "benefitsTitle",
+  "benefitsHint",
+  "benefit1Title",
+  "benefit1Text",
+  "benefit2Title",
+  "benefit2Text",
+  "benefit3Title",
+  "benefit3Text",
+  "checkoutIntroTitle",
+  "checkoutIntroText",
+  "seoTitle",
+  "seoDescription",
+];
 
 app.use(
   cors({
@@ -288,11 +313,23 @@ const parseCategoryPayload = (body, { partial = false } = {}) => {
   return { data, errors };
 };
 
+const parseStoreSettingsPayload = (body) => {
+  const settings = {};
+
+  for (const key of STORE_SETTING_KEYS) {
+    if (key in body) {
+      settings[key] = sanitizeText(body[key]);
+    }
+  }
+
+  return settings;
+};
+
 const getPublicSettings = async () => {
   const settings = await prisma.storeSetting.findMany({
     where: {
       key: {
-        in: ["heroImage"],
+        in: STORE_SETTING_KEYS,
       },
     },
   });
@@ -301,6 +338,98 @@ const getPublicSettings = async () => {
     acc[setting.key] = setting.value;
     return acc;
   }, {});
+};
+
+const getRequestBaseUrl = (req) => {
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const forwardedHost = req.headers["x-forwarded-host"];
+  const protocol = Array.isArray(forwardedProto)
+    ? forwardedProto[0]
+    : forwardedProto || req.protocol || "https";
+  const host = Array.isArray(forwardedHost)
+    ? forwardedHost[0]
+    : forwardedHost || req.get("host");
+
+  if (!host) {
+    return "";
+  }
+
+  return `${protocol}://${host}`.replace(/\/$/, "");
+};
+
+const getMercadoPagoNotificationUrl = (req) => {
+  if (MERCADO_PAGO_WEBHOOK_URL) {
+    return MERCADO_PAGO_WEBHOOK_URL;
+  }
+
+  const requestBaseUrl = getRequestBaseUrl(req);
+  return requestBaseUrl ? `${requestBaseUrl}/pagos/mercado-pago/webhook` : undefined;
+};
+
+const createOrderWithStock = async (tx, order, { status = "pendiente" } = {}) => {
+  const nuevoPedido = await tx.order.create({
+    data: {
+      customerName: order.customerName,
+      customerPhone: order.customerPhone,
+      address: order.address,
+      deliveryMethod: order.deliveryMethod,
+      notes: order.notes,
+      total: order.total,
+      status,
+    },
+  });
+
+  for (const item of order.items) {
+    const productoDB = order.products.find((product) => product.id === item.id);
+
+    await tx.orderItem.create({
+      data: {
+        orderId: nuevoPedido.id,
+        productId: productoDB.id,
+        productName: productoDB.name,
+        unitPrice: productoDB.price,
+        quantity: item.quantity,
+        subtotal: productoDB.price * item.quantity,
+      },
+    });
+
+    await tx.product.update({
+      where: { id: productoDB.id },
+      data: {
+        stock: {
+          decrement: item.quantity,
+        },
+      },
+    });
+  }
+
+  return nuevoPedido;
+};
+
+const buildOrderPayloadFromMercadoPago = (payment) => {
+  const metadata = payment?.metadata || {};
+  const itemsJson = metadata.itemsJson;
+
+  if (!itemsJson) {
+    throw new Error("La preferencia no envio itemsJson en metadata.");
+  }
+
+  let items;
+
+  try {
+    items = JSON.parse(itemsJson);
+  } catch {
+    throw new Error("No se pudo leer el carrito enviado por Mercado Pago.");
+  }
+
+  return {
+    customerName: metadata.customerName,
+    customerPhone: metadata.customerPhone,
+    address: metadata.address || "",
+    deliveryMethod: metadata.deliveryMethod,
+    notes: metadata.notes || "",
+    items,
+  };
 };
 
 const parseOrderItems = (items) => {
@@ -431,27 +560,29 @@ app.get("/admin/configuracion", async (req, res) => {
 
 app.patch("/admin/configuracion", async (req, res) => {
   try {
-    const heroImage = sanitizeText(req.body.heroImage);
+    const nextSettings = parseStoreSettingsPayload(req.body);
 
-    const setting = await prisma.storeSetting.upsert({
-      where: {
-        key: "heroImage",
-      },
-      update: {
-        value: heroImage,
-      },
-      create: {
-        key: "heroImage",
-        value: heroImage,
-      },
-    });
+    if (Object.keys(nextSettings).length === 0) {
+      return res.status(400).json({
+        error: "No hay cambios para guardar",
+        detalle: "Envia al menos una clave de configuracion editable.",
+      });
+    }
+
+    await prisma.$transaction(
+      Object.entries(nextSettings).map(([key, value]) =>
+        prisma.storeSetting.upsert({
+          where: { key },
+          update: { value },
+          create: { key, value },
+        })
+      )
+    );
 
     res.json({
       ok: true,
       message: "Configuracion actualizada correctamente",
-      settings: {
-        [setting.key]: setting.value,
-      },
+      settings: nextSettings,
     });
   } catch (error) {
     console.error("Error al actualizar configuracion:", error);
@@ -721,45 +852,9 @@ app.post("/pedidos", async (req, res) => {
       return sendValidationError(res, errors);
     }
 
-    const pedidoCreado = await prisma.$transaction(async (tx) => {
-      const nuevoPedido = await tx.order.create({
-        data: {
-          customerName: order.customerName,
-          customerPhone: order.customerPhone,
-          address: order.address,
-          deliveryMethod: order.deliveryMethod,
-          notes: order.notes,
-          total: order.total,
-          status: "pendiente",
-        },
-      });
-
-      for (const item of order.items) {
-        const productoDB = order.products.find((product) => product.id === item.id);
-
-        await tx.orderItem.create({
-          data: {
-            orderId: nuevoPedido.id,
-            productId: productoDB.id,
-            productName: productoDB.name,
-            unitPrice: productoDB.price,
-            quantity: item.quantity,
-            subtotal: productoDB.price * item.quantity,
-          },
-        });
-
-        await tx.product.update({
-          where: { id: productoDB.id },
-          data: {
-            stock: {
-              decrement: item.quantity,
-            },
-          },
-        });
-      }
-
-      return nuevoPedido;
-    });
+    const pedidoCreado = await prisma.$transaction((tx) =>
+      createOrderWithStock(tx, order, { status: "pendiente" })
+    );
 
     res.status(201).json({
       ok: true,
@@ -831,15 +926,21 @@ app.post("/pagos/mercado-pago/preferencia", async (req, res) => {
       auto_return: "approved",
       external_reference: `SUENA-${Date.now()}`,
       statement_descriptor: "SUENA EN GRANDE",
-      notification_url: MERCADO_PAGO_WEBHOOK_URL || undefined,
       metadata: {
         customerName: order.customerName,
         customerPhone: order.customerPhone,
         deliveryMethod: order.deliveryMethod,
         address: order.address || "",
         notes: order.notes || "",
+        itemsJson: JSON.stringify(order.items),
       },
     };
+
+    const notificationUrl = getMercadoPagoNotificationUrl(req);
+
+    if (notificationUrl) {
+      preferencePayload.notification_url = notificationUrl;
+    }
 
     const mpResponse = await fetch("https://api.mercadopago.com/checkout/preferences", {
       method: "POST",
@@ -871,6 +972,161 @@ app.post("/pagos/mercado-pago/preferencia", async (req, res) => {
     return res.status(500).json({
       error: "Error al preparar el pago con Mercado Pago",
       detalle: error.message,
+    });
+  }
+});
+
+app.get("/pagos/mercado-pago/webhook", (req, res) => {
+  res.json({
+    ok: true,
+    message: "Webhook de Mercado Pago preparado",
+  });
+});
+
+app.post("/pagos/mercado-pago/webhook", async (req, res) => {
+  try {
+    const topic = req.query.type || req.query.topic || req.body?.type || req.body?.topic || "";
+    const paymentId =
+      req.body?.data?.id ||
+      req.body?.id ||
+      req.query["data.id"] ||
+      req.query.id;
+
+    if (!paymentId || (topic && topic !== "payment")) {
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+      });
+    }
+
+    if (!MERCADO_PAGO_ACCESS_TOKEN) {
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "missing_access_token",
+      });
+    }
+
+    const paymentKey = `mercadoPagoPayment:${paymentId}`;
+    const existingPaymentRecord = await prisma.storeSetting.findUnique({
+      where: { key: paymentKey },
+    });
+
+    if (existingPaymentRecord?.value) {
+      return res.status(200).json({
+        ok: true,
+        processed: true,
+      });
+    }
+
+    const mpResponse = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+      headers: {
+        Authorization: `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    });
+    const payment = await mpResponse.json();
+
+    if (!mpResponse.ok) {
+      console.error("Error al consultar pago de Mercado Pago:", payment);
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "payment_lookup_failed",
+      });
+    }
+
+    if (payment.status !== "approved") {
+      await prisma.storeSetting.upsert({
+        where: { key: paymentKey },
+        update: {
+          value: JSON.stringify({
+            paymentId: String(payment.id),
+            status: payment.status,
+            statusDetail: payment.status_detail || "",
+            updatedAt: new Date().toISOString(),
+          }),
+        },
+        create: {
+          key: paymentKey,
+          value: JSON.stringify({
+            paymentId: String(payment.id),
+            status: payment.status,
+            statusDetail: payment.status_detail || "",
+            updatedAt: new Date().toISOString(),
+          }),
+        },
+      });
+
+      return res.status(200).json({
+        ok: true,
+        paymentStatus: payment.status,
+      });
+    }
+
+    const orderPayload = buildOrderPayloadFromMercadoPago(payment);
+    const { errors, order } = await validateOrderPayload(orderPayload);
+
+    if (errors.length > 0) {
+      await prisma.storeSetting.upsert({
+        where: { key: paymentKey },
+        update: {
+          value: JSON.stringify({
+            paymentId: String(payment.id),
+            status: "validation_error",
+            errors,
+            updatedAt: new Date().toISOString(),
+          }),
+        },
+        create: {
+          key: paymentKey,
+          value: JSON.stringify({
+            paymentId: String(payment.id),
+            status: "validation_error",
+            errors,
+            updatedAt: new Date().toISOString(),
+          }),
+        },
+      });
+
+      return res.status(200).json({
+        ok: true,
+        validationErrors: errors,
+      });
+    }
+
+    const createdOrder = await prisma.$transaction(async (tx) => {
+      const newOrder = await createOrderWithStock(tx, order, { status: "confirmado" });
+
+      await tx.storeSetting.create({
+        data: {
+          key: paymentKey,
+          value: JSON.stringify({
+            paymentId: String(payment.id),
+            merchantOrderId: payment.order?.id ? String(payment.order.id) : "",
+            externalReference: payment.external_reference || "",
+            status: payment.status,
+            orderId: newOrder.id,
+            total: payment.transaction_amount || order.total,
+            updatedAt: new Date().toISOString(),
+          }),
+        },
+      });
+
+      return newOrder;
+    });
+
+    return res.status(200).json({
+      ok: true,
+      orderId: createdOrder.id,
+      paymentStatus: payment.status,
+    });
+  } catch (error) {
+    console.error("Error en webhook de Mercado Pago:", error);
+    return res.status(200).json({
+      ok: true,
+      ignored: true,
+      reason: "webhook_exception",
     });
   }
 });
