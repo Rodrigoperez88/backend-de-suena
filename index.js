@@ -340,6 +340,15 @@ const getPublicSettings = async () => {
   }, {});
 };
 
+const buildStoreSettingsResponse = async () => {
+  const settings = await getPublicSettings();
+
+  return {
+    ...settings,
+    mercadoPagoEnabled: Boolean(MERCADO_PAGO_ACCESS_TOKEN),
+  };
+};
+
 const getRequestBaseUrl = (req) => {
   const forwardedProto = req.headers["x-forwarded-proto"];
   const forwardedHost = req.headers["x-forwarded-host"];
@@ -506,7 +515,7 @@ app.get("/categorias", async (req, res) => {
 
 app.get("/configuracion", async (req, res) => {
   try {
-    const settings = await getPublicSettings();
+    const settings = await buildStoreSettingsResponse();
 
     res.json(settings);
   } catch (error) {
@@ -546,7 +555,7 @@ app.get("/admin/productos", async (req, res) => {
 
 app.get("/admin/configuracion", async (req, res) => {
   try {
-    const settings = await getPublicSettings();
+    const settings = await buildStoreSettingsResponse();
 
     res.json(settings);
   } catch (error) {
